@@ -1,0 +1,365 @@
+#!/usr/bin/env python2
+
+import numpy as np
+import numpy.matlib as npm
+import argparse
+import json
+import pprint
+import exifread
+import cv2 as cv
+import os
+import pywt
+import math
+import progressbar
+import warnings
+from scipy import ndimage
+from PIL import Image
+from PIL.ExifTags import TAGS, GPSTAGS
+from matplotlib import pyplot as plt
+from os.path import basename
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Digital Image Forensics Tool")
+
+    parser.add_argument("image_file", metavar='file', help='Path to the image file')
+
+    parser.add_argument("-e", "--exif", help="Check EXIF metadata for forgery detection", action="store_true")
+    parser.add_argument("-gm", "--jpegghostm", help="JPEG Ghost (Multiple) analysis for forgery detection", action="store_true")
+    parser.add_argument("-g", "--jpegghost", help="JPEG Ghost analysis for forgery detection", action="store_true")
+    parser.add_argument("-n1", "--noise1", help="Detect forgery using noise inconsistencies", action="store_true")
+    parser.add_argument("-n2", "--noise2", help="Detect forgery using median-filter noise residue", action="store_true")
+    parser.add_argument("-el", "--ela", help="Error Level Analysis for forgery detection", action="store_true")
+    parser.add_argument("-cf", "--cfa", help="Detect tampering based on demosaicing artifacts", action="store_true")
+    parser.add_argument("-q", "--quality", help="Quality for re-saving image", type=int)
+    parser.add_argument("-s", "--blocksize", help="Block size for analysis", type=int)
+
+    args = parser.parse_args()
+
+    if not is_valid_file(args.image_file):
+        print("Invalid file. Ensure the file exists and is a JPEG image.")
+        return
+
+    if args.exif:
+        analyze_exif(args.image_file)
+    elif args.jpegghostm:
+        analyze_jpeg_ghost_multiple(args.image_file)
+    elif args.jpegghost:
+        analyze_jpeg_ghost(args.image_file, args.quality)
+    elif args.noise1:
+        analyze_noise_inconsistencies(args.image_file, args.blocksize)
+    elif args.noise2:
+        analyze_median_noise_inconsistencies(args.image_file, args.blocksize)
+    elif args.ela:
+        perform_ela(args.image_file, args.quality, args.blocksize)
+    elif args.cfa:
+        detect_cfa_tampering(args.image_file)
+    else:
+        analyze_exif(args.image_file)
+
+
+def is_valid_file(filepath):
+    return os.path.isfile(filepath) and filepath.lower().endswith(('.jpg', '.jpeg'))
+
+
+def analyze_exif(filepath):
+    with open(filepath, 'rb') as file:
+        tags = exifread.process_file(file)
+
+    exif_data = extract_exif_data(filepath)
+    if exif_data is None:
+        print("No EXIF data found. Image might be from social media sites.")
+        return
+
+    check_exif_software(exif_data)
+    check_exif_modify_date(exif_data)
+    check_exif_original_date(exif_data)
+    display_camera_info(tags)
+    check_gps_info(exif_data)
+    display_author_copyright(exif_data)
+
+    print("\nRAW IMAGE METADATA")
+    print("============================================================= \n")
+    print("EXIF Data")
+    for tag in tags.keys():
+        if tag not in ('JPEGThumbnail', 'TIFFThumbnail', 'Filename', 'EXIF MakerNote'):
+            print("%-35s:  %s" % (tag, tags[tag]))
+
+
+def extract_exif_data(image_path):
+    image = Image.open(image_path)
+    return image._getexif()
+
+
+def get_exif_value(data, key):
+    return data[key] if key in data else None
+
+
+def check_exif_software(info):
+    software = get_exif_value(info, 0x0131)
+    if software:
+        print("Image edited with: %s" % software)
+
+
+def check_exif_modify_date(info):
+    modify_date = get_exif_value(info, 0x0132)
+    if modify_date:
+        print("Photo modified on: %s" % modify_date)
+
+
+def check_exif_original_date(info):
+    original_date = get_exif_value(info, 0x9003)
+    create_date = get_exif_value(info, 0x9004)
+    if original_date:
+        print("Shutter actuation time: %s" % original_date)
+    if create_date:
+        print("Image created at: %s" % create_date)
+
+
+def display_camera_info(tags):
+    make = get_exif_value(tags, 'Image Make')
+    model = get_exif_value(tags, 'Image Model')
+    exposure = get_exif_value(tags, 'EXIF ExposureTime')
+    aperture = get_exif_value(tags, 'EXIF ApertureValue')
+    focal_length = get_exif_value(tags, 'EXIF FocalLength')
+    iso_speed = get_exif_value(tags, 'EXIF ISOSpeedRatings')
+    flash = get_exif_value(tags, 'EXIF Flash')
+
+    print("\nCamera Information")
+    print("-------------------------------------------------------------- ")
+    print("Make: \t \t %s" % make)
+    print("Model: \t \t %s" % model)
+    print("Exposure: \t %s" % exposure)
+    print("Aperture: \t %s" % aperture)
+    print("Focal Length: \t %s mm" % focal_length)
+    print("ISO Speed: \t %s" % iso_speed)
+    print("Flash: \t \t %s" % flash)
+
+
+def check_gps_info(info):
+    gps_info = get_exif_value(info, 0x8825)
+    print("\nLocation (GPS)")
+    print("-------------------------------------------------------------- ")
+    if not gps_info:
+        print("GPS coordinates not found")
+        return
+
+    gps_lat = get_exif_value(gps_info, 0x0002)
+    gps_lat_ref = get_exif_value(gps_info, 0x0001)
+    gps_lng = get_exif_value(gps_info, 0x0004)
+    gps_lng_ref = get_exif_value(gps_info, 0x0003)
+
+    if gps_lat and gps_lat_ref and gps_lng and gps_lng_ref:
+        lat = convert_to_degrees(gps_lat)
+        if gps_lat_ref != "N":
+            lat = -lat
+        lng = convert_to_degrees(gps_lng)
+        if gps_lng_ref != "E":
+            lng = -lng
+
+        print("Latitude: \t %s North" % lat)
+        print("Longitude: \t %s East" % lng)
+
+
+def convert_to_degrees(value):
+    d = float(value[0])
+    m = float(value[1])
+    s = float(value[2])
+    return d + (m / 60.0) + (s / 3600.0)
+
+
+def display_author_copyright(info):
+    author = get_exif_value(info, 0x9c9d)
+    copyright_tag = get_exif_value(info, 0x8298)
+    profile_copyright = get_exif_value(info, 0xc6fe)
+
+    print("\nAuthor and Copyright")
+    print("-------------------------------------------------------------- ")
+    print("Author: \t %s " % author)
+    print("Copyright: \t %s " % copyright_tag)
+    print("Profile: \t %s" % profile_copyright)
+
+
+def analyze_jpeg_ghost_multiple(filepath):
+    print("Analyzing...")
+    progress = progressbar.ProgressBar(maxval=20, widgets=[progressbar.Bar('=', '[', ']'), ' ', progressbar.Percentage()])
+    progress.start()
+
+    image = cv.imread(filepath)
+    img_rgb = image[:, :, ::-1]
+
+    quality = 60
+    block_size = 17
+    offset = int((block_size - 1) / 2)
+    height, width, _ = image.shape
+
+    plt.subplot(5, 4, 1), plt.imshow(img_rgb), plt.title('Original')
+    plt.xticks([]), plt.yticks([])
+
+    base = basename(filepath)
+    file_name = os.path.splitext(base)[0]
+    temp_filename = file_name + "_temp.jpg"
+    progress.update(1)
+
+    for i in range(19):
+        encode_params = [int(cv.IMWRITE_JPEG_QUALITY), quality]
+        cv.imwrite(temp_filename, image, encode_params)
+
+        resaved_img = cv.imread(temp_filename)
+        resaved_rgb = resaved_img[:, :, ::-1]
+
+        diff = (img_rgb - resaved_rgb) ** 2
+        kernel = np.ones((block_size, block_size), np.float32) / (block_size ** 2)
+        diff = cv.filter2D(diff, -1, kernel)
+        diff = np.average(diff, axis=-1)
+        diff = diff[offset:height - offset, offset:width - offset]
+        norm_component = diff.min() / (diff.max() - diff.min())
+        result = diff - norm_component
+
+        plt.subplot(5, 4, i + 2), plt.imshow(result, cmap='gray'), plt.title(quality)
+        plt.xticks([]), plt.yticks([])
+        quality += 2
+        progress.update(i + 2)
+
+    progress.finish()
+    print("Done")
+    plt.suptitle('Exposing forgery by resaving with different qualities (JPEG Ghost Multiple)')
+    plt.show()
+
+    if os.path.isfile(temp_filename):
+        os.remove(temp_filename)
+
+
+def analyze_jpeg_ghost(filepath, quality=80):
+    print("Analyzing...")
+
+    image = cv.imread(filepath)
+    img_rgb = image[:, :, ::-1]
+
+    block_size = 17
+    offset = int((block_size - 1) / 2)
+    height, width, _ = image.shape
+
+    base = basename(filepath)
+    file_name = os.path.splitext(base)[0]
+    temp_filename = file_name + "_temp.jpg"
+
+    encode_params = [int(cv.IMWRITE_JPEG_QUALITY), quality]
+    cv.imwrite(temp_filename, image, encode_params)
+
+    resaved_img = cv.imread(temp_filename)
+    resaved_rgb = resaved_img[:, :, ::-1]
+
+    diff = (img_rgb - resaved_rgb) ** 2
+    kernel = np.ones((block_size, block_size), np.float32) / (block_size ** 2)
+    diff = cv.filter2D(diff, -1, kernel)
+    diff = np.average(diff, axis=-1)
+    diff = diff[offset:height - offset, offset:width - offset]
+    norm_component = diff.min() / (diff.max() - diff.min())
+    result = diff - norm_component
+
+    if os.path.isfile(temp_filename):
+        os.remove(temp_filename)
+
+    plt.subplot(1, 2, 1), plt.imshow(img_rgb), plt.title('Original')
+    plt.xticks([]), plt.yticks([])
+    plt.subplot(1, 2, 2), plt.imshow(result, cmap='gray'), plt.title('Result')
+    plt.xticks([]), plt.yticks([])
+    plt.suptitle('Exposing forgery by resaving (JPEG Ghost)')
+    plt.show()
+
+
+def analyze_noise_inconsistencies(filepath, blocksize=3):
+    img = cv.imread(filepath, 0)
+    img = np.float32(img) / 255.0
+    wavelet = 'haar'
+    level = 4
+
+    coeffs = pywt.wavedec2(img, wavelet, mode='periodization', level=level)
+    wavelet_coeffs = np.abs(coeffs[-1][0]) + np.abs(coeffs[-1][1]) + np.abs(coeffs[-1][2])
+
+    mean = ndimage.uniform_filter(wavelet_coeffs, blocksize)
+    variance = ndimage.uniform_filter(wavelet_coeffs ** 2, blocksize) - mean ** 2
+    st_dev = np.sqrt(variance)
+    result = (wavelet_coeffs - mean) / st_dev
+
+    plt.subplot(1, 2, 1), plt.imshow(img, cmap='gray'), plt.title('Original')
+    plt.xticks([]), plt.yticks([])
+    plt.subplot(1, 2, 2), plt.imshow(result, cmap='jet'), plt.title('Result')
+    plt.xticks([]), plt.yticks([])
+    plt.suptitle('Noise Inconsistencies Analysis')
+    plt.show()
+
+
+def analyze_median_noise_inconsistencies(filepath, blocksize=3):
+    img = cv.imread(filepath, 0)
+    img = np.float32(img) / 255.0
+
+    median_filtered = ndimage.median_filter(img, blocksize)
+    noise_residue = img - median_filtered
+    wavelet = 'db1'
+    coeffs = pywt.wavedec2(noise_residue, wavelet, mode='periodization', level=1)
+
+    result = np.abs(coeffs[-1][0]) + np.abs(coeffs[-1][1]) + np.abs(coeffs[-1][2])
+
+    plt.subplot(1, 2, 1), plt.imshow(img, cmap='gray'), plt.title('Original')
+    plt.xticks([]), plt.yticks([])
+    plt.subplot(1, 2, 2), plt.imshow(result, cmap='jet'), plt.title('Result')
+    plt.xticks([]), plt.yticks([])
+    plt.suptitle('Median-Filter Noise Residue Analysis')
+    plt.show()
+
+
+def perform_ela(filepath, quality=90, blocksize=8):
+    original = Image.open(filepath)
+    ela_path = 'temp_ela.jpg'
+    original.save(ela_path, 'JPEG', quality=quality)
+    resaved = Image.open(ela_path)
+
+    ela_img = Image.new('RGB', original.size)
+    pixels_original = original.load()
+    pixels_resaved = resaved.load()
+    pixels_ela = ela_img.load()
+
+    for x in range(original.size[0]):
+        for y in range(original.size[1]):
+            diff = tuple([abs(pixels_original[x, y][i] - pixels_resaved[x, y][i]) for i in range(3)])
+            pixels_ela[x, y] = diff
+
+    ela_img.save('ela_output.jpg')
+
+    plt.subplot(1, 2, 1), plt.imshow(original), plt.title('Original')
+    plt.xticks([]), plt.yticks([])
+    plt.subplot(1, 2, 2), plt.imshow(ela_img), plt.title('ELA')
+    plt.xticks([]), plt.yticks([])
+    plt.suptitle('Error Level Analysis')
+    plt.show()
+
+    if os.path.isfile(ela_path):
+        os.remove(ela_path)
+
+
+def detect_cfa_tampering(filepath):
+    img = cv.imread(filepath, 0)
+    img = np.float32(img) / 255.0
+    wavelet = 'haar'
+    level = 4
+
+    coeffs = pywt.wavedec2(img, wavelet, mode='periodization', level=level)
+    wavelet_coeffs = np.abs(coeffs[-1][0]) + np.abs(coeffs[-1][1]) + np.abs(coeffs[-1][2])
+
+    mean = ndimage.uniform_filter(wavelet_coeffs, 3)
+    variance = ndimage.uniform_filter(wavelet_coeffs ** 2, 3) - mean ** 2
+    st_dev = np.sqrt(variance)
+    cfa_result = (wavelet_coeffs - mean) / st_dev
+
+    plt.subplot(1, 2, 1), plt.imshow(img, cmap='gray'), plt.title('Original')
+    plt.xticks([]), plt.yticks([])
+    plt.subplot(1, 2, 2), plt.imshow(cfa_result, cmap='jet'), plt.title('Result')
+    plt.xticks([]), plt.yticks([])
+    plt.suptitle('CFA Tampering Detection')
+    plt.show()
+
+
+if __name__ == '__main__':
+    main()
